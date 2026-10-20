@@ -54,6 +54,60 @@ th { font-size:12px; color:var(--muted); }
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 let DATA, cur, sub = "Matches";
+// ---- team progress (Supabase, encrypted, append-only) ----
+let PG = null;                        // { cfg, aes, mac, latest: {item: entry} }
+const ITEM = {};                      // "slug|url_key" -> item id
+const STATUSES = [["", "-"], ["saved", "Saved"], ["applied", "Applied"], ["interview", "Interview"], ["offer", "Offer"], ["rejected", "Rejected"], ["skipped", "Skip"]];
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+async function progressInit(pw) {
+  const cfg = DATA.progress; if (!cfg) return;
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", salt: b64(cfg.salt), iterations: cfg.iterations, hash: "SHA-256" }, base, 512));
+  const aes = await crypto.subtle.importKey("raw", bits.slice(0, 32), "AES-GCM", false, ["encrypt", "decrypt"]);
+  const mac = await crypto.subtle.importKey("raw", bits.slice(32), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  PG = { cfg, aes, mac, latest: {}, ok: true };
+  await progressLoad();
+}
+function sbHeaders(extra) { return { apikey: PG.cfg.key, Authorization: "Bearer " + PG.cfg.key, "Content-Type": "application/json", ...(extra || {}) }; }
+async function progressLoad() {
+  try {
+    for (let off = 0; ; off += 1000) {
+      const r = await fetch(`${PG.cfg.url}/rest/v1/${PG.cfg.table}?team=eq.${encodeURIComponent(PG.cfg.team)}&select=item,payload,created_at&order=id.asc`,
+                            { headers: sbHeaders({ Range: `${off}-${off + 999}` }) });
+      if (!r.ok) throw new Error("progress server answered " + r.status);
+      const rows = await r.json();
+      for (const row of rows) {
+        try {
+          const raw = b64(row.payload);
+          const e = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: raw.slice(0, 12) }, PG.aes, raw.slice(12))));
+          e.saved_at = row.created_at; PG.latest[row.item] = e;
+        } catch (_) { /* junk or old-password rows are ignored */ }
+      }
+      if (rows.length < 1000) break;
+    }
+  } catch (e) { PG.ok = false; PG.err = e.message; }
+}
+async function itemFor(slug, key) {
+  const k = slug + "|" + key;
+  if (!ITEM[k]) ITEM[k] = hex(await crypto.subtle.sign("HMAC", PG.mac, new TextEncoder().encode(k))).slice(0, 40);
+  return ITEM[k];
+}
+async function progressSave(slug, r, status, note) {
+  const item = await itemFor(slug, r.url_key);
+  const entry = { member: slug, job: r.url_key, status, note, by: localStorage.getItem("tb_name") || "", at: new Date().toISOString(),
+                  company: r.company, title: r.title };
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, PG.aes, new TextEncoder().encode(JSON.stringify(entry))));
+  const payload = btoa(String.fromCharCode(...iv, ...ct));
+  const res = await fetch(`${PG.cfg.url}/rest/v1/${PG.cfg.table}`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal" }),
+                                                                     body: JSON.stringify({ team: PG.cfg.team, item, payload }) });
+  if (!res.ok) throw new Error("Save failed (" + res.status + ")");
+  PG.latest[item] = { ...entry, saved_at: entry.at };
+}
+async function current(slug, r) {          // newest saved progress, else what TeamBid exported
+  if (PG && PG.ok) { const e = PG.latest[await itemFor(slug, r.url_key)]; if (e) return e; }
+  return { status: r.progress || "", note: r.note || "" };
+}
 async function decrypt(blob, password) {
   const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
   const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: b64(blob.salt), iterations: blob.iterations, hash: "SHA-256" },
@@ -65,8 +119,10 @@ async function unlock(pw, remember) {
   const blob = await (await fetch("data.enc.json", { cache: "no-store" })).json();
   try { DATA = await decrypt(blob, pw); } catch (e) { throw new Error("Wrong password."); }
   (remember ? localStorage : sessionStorage).setItem("tb_pw", pw);
+  await progressInit(pw);
   document.getElementById("lock").classList.add("hide"); document.getElementById("app").classList.remove("hide");
-  document.getElementById("meta").textContent = `last scan ${DATA.last_scan || "-"} · updated ${DATA.generated}`;
+  document.getElementById("meta").textContent = `last scan ${DATA.last_scan || "-"} · updated ${DATA.generated}` +
+    (PG ? (PG.ok ? " · team progress on" : ` · progress unavailable (${PG.err})`) : "");
   document.getElementById("tabs").innerHTML = DATA.members.map(m => `<button data-id="${m.id}">${esc(m.name)} (${m.matches.length})</button>`).join("");
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => pick(b.dataset.id));
   pick(location.hash.slice(1).split("/")[0]);
@@ -85,6 +141,34 @@ function pick(id) {
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.id === cur.id));
   location.hash = cur.id; draw();
 }
+// Applications = what TeamBid exported + live team progress (Saved/Applied/Interview/Offer/Rejected), newest first
+const APP_LABEL = { drafting: "Prepared", saved: "Saved", applied: "Applied", interview: "Interview", offer: "Offer",
+                    rejected: "Rejected", withdrawn: "Withdrawn", closed: "Closed" };
+async function appsView(m, body) {
+  const rows = {}, byKey = Object.fromEntries(m.matches.map(r => [r.url_key, r]));
+  for (const a of m.applications)
+    rows[a.url_key || "app" + a.id] = { company: a.company, title: a.title, url: a.url, status: a.status, fit: a.fit,
+                                        note: a.notes || "", by: "", when: (a.updated || "").slice(0, 10) };
+  if (PG && PG.ok) {
+    for (const e of Object.values(PG.latest)) {
+      if (e.member !== m.slug) continue;
+      const r = byKey[e.job] || {}, old = rows[e.job];
+      if (!e.status || e.status === "skipped") { if (old && old.live) delete rows[e.job]; continue; }
+      rows[e.job] = { company: e.company || r.company || old?.company, title: e.title || r.title || old?.title, url: r.url || old?.url,
+                      status: e.status, fit: old?.fit, note: e.note || "", by: e.by || "", when: (e.saved_at || e.at || "").slice(0, 10), live: true };
+    }
+  }
+  const order = ["offer", "interview", "applied", "saved", "drafting", "rejected", "withdrawn", "closed"];
+  const list = Object.values(rows).sort((a, b) => (order.indexOf(a.status) - order.indexOf(b.status)) || (b.when || "").localeCompare(a.when || ""));
+  const counts = order.map(s => [s, list.filter(x => x.status === s).length]).filter(([, n]) => n);
+  body.innerHTML = `<div class="card">${counts.map(([s, n]) => `<span class="pill">${APP_LABEL[s] || s}: ${n}</span>`).join(" ") || ""}
+    ${PG ? "" : '<div class="muted">Team progress is off, showing what TeamBid exported.</div>'}</div>
+    <div class="card"><table><tr><th>Company</th><th>Role</th><th>Status</th><th class="m-hide">Fit</th><th>Note</th><th>Updated</th></tr>${list.map(a =>
+      `<tr><td>${esc(a.company || "")}</td><td>${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.title || "")}</a>` : esc(a.title || "")}</td>
+       <td>${esc(APP_LABEL[a.status] || a.status)}</td><td class="m-hide">${a.fit != null ? a.fit + "%" : ""}</td><td class="muted">${esc(a.note)}</td>
+       <td>${esc(a.when || "")}${a.by ? `<div class="muted" style="font-size:11px">${esc(a.by)}</div>` : ""}</td></tr>`).join("")
+      || '<tr><td colspan=6 class="muted">No applications yet. Set a job to Saved or Applied in the Matches tab and it shows up here.</td></tr>'}</table></div>`;
+}
 function draw() {
   const m = cur, v = document.getElementById("view");
   const subs = ["Matches", "Overview", "Applications", "Experience"];
@@ -98,14 +182,12 @@ function draw() {
         <div class="muted">Remote from: ${esc((m.countries||[]).join(", "))} (${esc(m.region)})</div></div>
       <div class="card"><h2>Contact</h2>${Object.entries(c).map(([k,x]) => `<div><span class="muted">${esc(k)}:</span> ${esc(x)}</div>`).join("") || "-"}</div>
       <div class="card"><h2>Resume score</h2><div class="big">${m.audit.score}<span class="muted" style="font-size:14px">/100 · ${esc(m.audit.grade)}</span></div>
-        <div class="muted">${m.matches.length} matches, ${m.best} best fits, ${m.applications.length} applications</div></div></div>
+        <div class="muted">${m.matches.length} matches, ${m.best} best fits, ${m.applications.length} applications tracked in TeamBid</div></div></div>
       <div class="card"><h2>Resume fixes</h2><table><tr><th>Priority</th><th>Area</th><th>What to change</th></tr>${m.audit.findings.map(f =>
         `<tr><td>${["","Low","Medium","High"][f.severity]}</td><td>${esc(f.area)}</td><td>${esc(f.message)}</td></tr>`).join("") || "<tr><td colspan=3>Nothing major.</td></tr>"}</table></div>
       <div class="card"><h2>Target titles</h2>${esc((m.target_titles||[]).join(", "))}</div>`;
   } else if (sub === "Applications") {
-    body.innerHTML = `<div class="card"><table><tr><th>Company</th><th>Role</th><th>Status</th><th>Fit</th><th>Updated</th></tr>${m.applications.map(a =>
-      `<tr><td>${esc(a.company)}</td><td>${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.title)}</a>` : esc(a.title)}</td>
-       <td>${esc(a.status)}</td><td>${a.fit ?? ""}%</td><td>${esc(a.updated)}</td></tr>`).join("") || '<tr><td colspan=5 class="muted">No applications yet.</td></tr>'}</table></div>`;
+    appsView(m, body);
   } else if (sub === "Experience") {
     const sk = m.skills || {};
     body.innerHTML = `<div class="card"><h2>Skills</h2><div><b>Proven:</b> ${esc((sk.proven||[]).join(", "))}</div><div class="muted"><b>Listed:</b> ${esc((sk.listed_only||[]).join(", "))}</div></div>` +
@@ -115,17 +197,37 @@ function draw() {
   } else {
     body.innerHTML = `<div class="card"><div class="row"><input id="q" placeholder="Search company or title" style="flex:1;min-width:200px">
       <select id="tier"><option value="">All tiers</option><option value="best">Best fits</option><option value="consider">Worth a look</option></select>
-      <select id="st"><option value="">Any status</option><option>new</option><option>shortlisted</option><option>applying</option><option>skipped</option></select>
-      <span class="muted" id="count"></span></div></div>
-      <div class="card"><table><thead><tr><th>Score</th><th>Company</th><th>Title</th><th class="m-hide">Location</th><th>Posted</th><th class="m-hide">Status</th><th class="m-hide">Why</th></tr></thead><tbody id="rows"></tbody></table></div>`;
-    const go = () => {
+      <select id="st"><option value="">Any progress</option><option value="none">Not started</option>${STATUSES.slice(1).map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+      ${PG ? `<input id="me" placeholder="Your name (shown on updates)" value="${esc(localStorage.getItem("tb_name") || "")}" style="width:190px">` : ""}
+      <span class="muted" id="count"></span></div>
+      ${PG ? '<div class="muted" style="margin-top:6px">Set a status or note on any job: it is saved for the whole team (encrypted) and synced into TeamBid daily.</div>' : ""}</div>
+      <div class="card"><table><thead><tr><th>Score</th><th>Company</th><th>Title</th><th class="m-hide">Location</th><th>Posted</th><th>Progress</th><th class="m-hide">Why</th></tr></thead><tbody id="rows"></tbody></table></div>`;
+    if (PG) document.getElementById("me").oninput = e => localStorage.setItem("tb_name", e.target.value.trim());
+    const go = async () => {
       const q = document.getElementById("q").value.toLowerCase(), t = document.getElementById("tier").value, s = document.getElementById("st").value;
-      const rows = m.matches.filter(r => (!t || r.tier === t) && (!s || r.status === s) && (!q || (r.company + " " + r.title).toLowerCase().includes(q)));
+      const states = await Promise.all(m.matches.map(r => current(m.slug, r)));
+      const rows = m.matches.map((r, i) => [r, states[i]]).filter(([r, e]) => (!t || r.tier === t) &&
+        (!s || (s === "none" ? !e.status : e.status === s)) && (!q || (r.company + " " + r.title).toLowerCase().includes(q)));
       document.getElementById("count").textContent = `${rows.length} shown`;
-      document.getElementById("rows").innerHTML = rows.map(r => `<tr><td><span class="pill ${r.tier}">${r.score}</span></td><td>${esc(r.company)}</td>
+      document.getElementById("rows").innerHTML = rows.map(([r, e]) => `<tr><td><span class="pill ${r.tier}">${r.score}</span></td><td>${esc(r.company)}</td>
         <td><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}</a></td><td class="m-hide">${esc((r.location||"").slice(0,50))}</td>
-        <td>${esc(r.posted || "?")}</td><td class="m-hide">${esc(r.status)}</td><td class="muted m-hide">${esc((r.reasons||[]).join("; "))}</td></tr>`).join("")
-        || '<tr><td colspan=7 class="muted">No matches.</td></tr>';
+        <td>${esc(r.posted || "?")}</td>
+        <td>${PG && PG.ok ? `<select data-k="${esc(r.url_key)}" class="pst">${STATUSES.map(([v, l]) => `<option value="${v}" ${v === (e.status || "") ? "selected" : ""}>${l}</option>`).join("")}</select>
+             <input data-k="${esc(r.url_key)}" class="pnote" placeholder="note" value="${esc(e.note || "")}" style="width:120px">
+             ${e.by || e.saved_at ? `<div class="muted" style="font-size:11px">${esc(e.by || "")} ${esc((e.saved_at || e.at || "").slice(0, 10))}</div>` : ""}`
+           : esc(STATUSES.find(([v]) => v === (e.status || ""))?.[1] || "-")}</td>
+        <td class="muted m-hide">${esc((r.reasons||[]).join("; "))}</td></tr>`).join("") || '<tr><td colspan=7 class="muted">No matches.</td></tr>';
+      const byKey = Object.fromEntries(m.matches.map(r => [r.url_key, r]));
+      const save = async el => {
+        const k = el.dataset.k, row = el.closest("tr");
+        const status = row.querySelector(".pst").value, note = row.querySelector(".pnote").value.trim();
+        el.disabled = true;
+        try { await progressSave(m.slug, byKey[k], status, note); el.style.outline = "2px solid var(--go)"; }
+        catch (err) { alert(err.message); }
+        el.disabled = false;
+      };
+      document.querySelectorAll(".pst").forEach(el => el.onchange = () => save(el));
+      document.querySelectorAll(".pnote").forEach(el => el.onchange = () => save(el));
     };
     ["q", "tier", "st"].forEach(id => document.getElementById(id).addEventListener(id === "q" ? "input" : "change", go));
     go();
